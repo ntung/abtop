@@ -144,7 +144,7 @@ pub const MAX_CHAT_MESSAGES: usize = 12;
 /// executable path in its command line. Always `Cli` for Codex and OpenCode
 /// sessions — no desktop-app or editor-extension equivalent is known for
 /// those tools yet.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LaunchSurface {
     /// Plain CLI invocation: a terminal shell running an npm/homebrew/native
     /// install (or the auto-updater's `versions/<ver>` layout).
@@ -153,6 +153,16 @@ pub enum LaunchSurface {
     App,
     /// An editor extension (VS Code, Cursor, Windsurf, ...).
     Ide,
+}
+
+impl Default for LaunchSurface {
+    /// Used when a `RemoteCollector` deserializes a session missing (or
+    /// failing to parse) its `launch_surface` field — same fallback
+    /// `ClaudeCollector::detect_launch_surface` uses when detection itself
+    /// is inconclusive.
+    fn default() -> Self {
+        LaunchSurface::Cli
+    }
 }
 
 impl LaunchSurface {

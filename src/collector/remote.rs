@@ -22,7 +22,8 @@
 use super::{AgentCollector, SharedProcessData};
 use crate::config::RemoteHostConfig;
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, SessionStatus, SubAgent, ToolCall,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, LaunchSurface, SessionStatus, SubAgent,
+    ToolCall,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -336,6 +337,7 @@ struct RemoteSnapshotDto {
 #[serde(default)]
 struct RemoteSessionDto {
     agent_cli: String,
+    launch_surface: LaunchSurface,
     pid: u32,
     session_id: String,
     project_name: String,
@@ -426,6 +428,7 @@ impl RemoteSessionDto {
     fn into_agent_session(self, host: &str) -> AgentSession {
         AgentSession {
             agent_cli: intern_agent_cli(&self.agent_cli),
+            launch_surface: self.launch_surface,
             pid: self.pid,
             session_id: self.session_id,
             cwd: self.cwd,
@@ -494,6 +497,7 @@ mod tests {
                 "sessions": [{{
                     "host": null,
                     "agent_cli": "claude",
+                    "launch_surface": "Ide",
                     "pid": 4242,
                     "session_id": "abc-123",
                     "project_name": "abtop",
@@ -542,6 +546,7 @@ mod tests {
         let s = &sessions[0];
         assert_eq!(s.host.as_deref(), Some("devbox"));
         assert_eq!(s.agent_cli, "claude");
+        assert_eq!(s.launch_surface, LaunchSurface::Ide);
         assert_eq!(s.pid, 4242);
         assert_eq!(s.session_id, "abc-123");
         assert_eq!(s.model, "claude-opus-4-6");
@@ -585,6 +590,21 @@ mod tests {
         );
         let sessions = parse_remote_snapshot(&json, "devbox").expect("degrades, doesn't fail");
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn session_missing_launch_surface_defaults_to_cli() {
+        // An older remote abtop built before launch_surface existed (e.g.
+        // one built from this branch alone, without the launch-surface
+        // feature merged in) shouldn't fail to parse — every other field
+        // in a minimal session object degrades the same way.
+        let json = format!(
+            r#"{{"schema_version": {}, "sessions": [{{"agent_cli": "claude", "pid": 1, "session_id": "s"}}]}}"#,
+            crate::snapshot::SCHEMA_VERSION
+        );
+        let sessions = parse_remote_snapshot(&json, "devbox").expect("degrades, doesn't fail");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].launch_surface, LaunchSurface::Cli);
     }
 
     #[test]
