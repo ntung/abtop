@@ -1,4 +1,4 @@
-use crate::collector::{read_rate_limits, McpServer, MultiCollector};
+use crate::collector::{read_rate_limits, McpServer, MultiCollector, RemoteHostStatus};
 use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::theme::Theme;
@@ -727,6 +727,19 @@ impl App {
         if matches!(session.status, SessionStatus::Done | SessionStatus::Unknown) {
             return;
         }
+        // PIDs are only unique per host: `session.pid` for a remote session
+        // means nothing against this machine's `ps`/`kill`, and could even
+        // collide with an unrelated live local process. Remote kill isn't
+        // implemented (see docs/design/remote-ssh-monitoring.md) — bail
+        // with a clear message rather than silently doing nothing, or
+        // worse, acting on the wrong local PID.
+        if let Some(host) = &session.host {
+            self.set_status(format!(
+                "kill isn't supported for remote sessions ({})",
+                host
+            ));
+            return;
+        }
 
         // Check if we have a pending confirmation for this exact session
         if let Some((idx, ts)) = self.kill_confirm.take() {
@@ -802,6 +815,13 @@ impl App {
         self.should_quit = true;
     }
 
+    /// Status of every configured `[[remote_hosts]]` entry, in config order.
+    /// Empty when none are configured. For the sessions panel's `[host]`
+    /// row prefix and stale-while-unreachable treatment.
+    pub fn remote_host_statuses(&self) -> Vec<RemoteHostStatus> {
+        self.collector.remote_host_statuses()
+    }
+
     /// Jump to the terminal running the selected session's agent process.
     /// Delegates to the terminal-jumper registry (cmux / tmux / iTerm2);
     /// see [`crate::jump`]. No-op when nothing is selected or no backend
@@ -810,7 +830,18 @@ impl App {
         if self.sessions.is_empty() {
             return JumpOutcome::NoOp;
         }
-        let target_pid = self.sessions[self.selected].pid;
+        let selected = &self.sessions[self.selected];
+        // Same reasoning as the remote guard in `kill_selected`: `pid` is
+        // only meaningful on the host that collected it, and terminal jump
+        // for remote sessions isn't implemented (see
+        // docs/design/remote-ssh-monitoring.md).
+        if let Some(host) = &selected.host {
+            return JumpOutcome::Failed(format!(
+                "jump isn't supported for remote sessions ({})",
+                host
+            ));
+        }
+        let target_pid = selected.pid;
         crate::jump::run_jump(target_pid)
     }
 
@@ -1126,5 +1157,57 @@ mod tests {
         assert!(!is_killable_agent_command(
             "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
         ));
+    }
+
+    fn remote_session(host: &str) -> AgentSession {
+        let mut s = waiting_session("claude");
+        s.host = Some(host.to_string());
+        s
+    }
+
+    #[test]
+    fn kill_selected_refuses_remote_sessions() {
+        // PIDs are only unique per host; kill must never fire against
+        // `session.pid` for a session tagged with a remote host.
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.sessions = vec![remote_session("devbox")];
+        app.selected = 0;
+
+        app.kill_selected();
+
+        assert!(
+            app.kill_confirm.is_none(),
+            "must never arm a kill confirmation for a remote session"
+        );
+        let msg = app
+            .status_msg
+            .as_ref()
+            .map(|(m, _)| m.as_str())
+            .unwrap_or("");
+        assert!(msg.contains("remote"), "status should explain why: {msg}");
+        assert!(msg.contains("devbox"), "status should name the host: {msg}");
+    }
+
+    #[test]
+    fn jump_to_session_refuses_remote_sessions() {
+        let mut app = App::new_with_config(
+            Theme::default(),
+            &[],
+            crate::config::PanelVisibility::default(),
+        );
+        app.sessions = vec![remote_session("devbox")];
+        app.selected = 0;
+
+        match app.jump_to_session() {
+            JumpOutcome::Failed(msg) => {
+                assert!(msg.contains("remote"), "status should explain why: {msg}");
+                assert!(msg.contains("devbox"), "status should name the host: {msg}");
+            }
+            other => panic!("expected Failed for a remote session, got {other:?}"),
+        }
     }
 }

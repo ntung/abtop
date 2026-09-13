@@ -180,7 +180,22 @@ hold and one is broader than necessary:
     `kill_orphan_ports`. Fixing both at collection time also means
     `OrphanPort` never needs a `host` field, and `kill_orphan_ports` never
     needs its own guard.
-- **Phase 3 — remaining safety guards + UI.** Guard `kill_selected` and
-  `jump_to_selected` on `session.host.is_none()` (`kill_orphan_ports` no
-  longer needs one — see above). Add the `[hostname]` row prefix and
-  "stale, Ns ago" greying, sourced from `RemoteCollector::host_statuses()`.
+- **Phase 3 — remaining safety guards + UI. Done.**
+  - `kill_selected` and `jump_to_session` (`App`) now bail with a status
+    message naming the host when `session.host.is_some()`, rather than
+    acting on a PID that's only meaningful on another machine
+    (`kill_orphan_ports` needed no guard — see the Phase 2 note above).
+  - `MultiCollector` holds its `RemoteCollector` in its own field (not
+    type-erased into the generic `collectors: Vec<Box<dyn AgentCollector>>`)
+    specifically so `remote_host_statuses()` can be queried directly for the
+    UI, without downcasting a trait object.
+  - Sessions panel (`ui/sessions.rs`): the project column shows `[host]
+    project` for a remote session (`project_display_name`); a session whose
+    host is currently unreachable gets the same dimming as a Done session,
+    and its task line is replaced with `stale, Ns ago` / `unreachable`
+    (`remote_stale_task_text`) instead of showing last-known-good task text
+    as if it were live. Note: the project column is only 8-14 chars
+    depending on terminal width, so on a narrow terminal `[host]` can crowd
+    out most of the actual project name — accepted as the same kind of
+    graceful truncation the rest of this panel already does, not a new
+    failure mode.

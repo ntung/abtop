@@ -287,6 +287,10 @@ impl Drop for DesktopRolloutScanner {
 /// Aggregates sessions from multiple collectors (Claude, Codex, etc.)
 pub struct MultiCollector {
     collectors: Vec<Box<dyn AgentCollector>>,
+    /// Kept out of `collectors` (rather than boxed as `dyn AgentCollector`
+    /// alongside the rest) so the UI can query per-host reachability
+    /// (`remote_host_statuses`) without downcasting a trait object.
+    remote: Option<RemoteCollector>,
     codex_enabled: bool,
     tick_count: u32,
     cached_ports: HashMap<u32, Vec<u16>>,
@@ -338,12 +342,15 @@ impl MultiCollector {
         if !is_hidden("opencode") {
             collectors.push(Box::new(OpenCodeCollector::new()));
         }
-        if !remote_hosts.is_empty() {
-            collectors.push(Box::new(RemoteCollector::new(remote_hosts.to_vec())));
-        }
+        let remote = if remote_hosts.is_empty() {
+            None
+        } else {
+            Some(RemoteCollector::new(remote_hosts.to_vec()))
+        };
         let codex_enabled = !is_hidden("codex");
         Self {
             collectors,
+            remote,
             codex_enabled,
             tick_count: SLOW_POLL_INTERVAL, // trigger on first tick
             cached_ports: HashMap::new(),
@@ -359,6 +366,16 @@ impl MultiCollector {
 
     pub fn set_mcp_suppress(&mut self, on: bool) {
         self.mcp_suppress = on;
+    }
+
+    /// Status of every configured `[[remote_hosts]]` entry, in config order.
+    /// Empty when none are configured. For the UI's `[host]` row prefix and
+    /// stale-while-unreachable treatment.
+    pub fn remote_host_statuses(&self) -> Vec<RemoteHostStatus> {
+        self.remote
+            .as_ref()
+            .map(RemoteCollector::host_statuses)
+            .unwrap_or_default()
     }
 
     /// Collect rate limit info from all registered collectors.
@@ -420,6 +437,9 @@ impl MultiCollector {
         let mut all = Vec::new();
         for collector in &mut self.collectors {
             all.extend(collector.collect(&shared));
+        }
+        if let Some(remote) = &mut self.remote {
+            all.extend(remote.collect(&shared));
         }
 
         // Git stats: refresh only on slow tick. `s.cwd` is a path on
