@@ -1316,6 +1316,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            host: None,
         });
 
         let backend = TestBackend::new(120, 20);
@@ -1517,6 +1518,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: "~/.claude".into(),
+            host: None,
         }
     }
 }

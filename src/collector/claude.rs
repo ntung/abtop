@@ -712,6 +712,7 @@ impl ClaudeCollector {
             thinking_since_ms: cached.last_user_ts_ms,
             file_accesses,
             config_root: super::abbrev_path(&config.base_dir()),
+            host: None,
         })
     }
 

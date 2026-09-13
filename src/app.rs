@@ -1054,6 +1054,7 @@ mod tests {
             config_root: String::new(),
             git_added: 0,
             git_modified: 0,
+            host: None,
         }
     }
 
