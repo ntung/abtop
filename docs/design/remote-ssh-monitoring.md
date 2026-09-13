@@ -1,6 +1,10 @@
 # Design: Remote/SSH session monitoring
 
-Status: sketch / not yet implemented. Currently listed as a Non-Goal (v0.1) in AGENTS.md.
+Status: implemented on `feat/remote-ssh-monitoring` (all four phases below)
+and verified against a live remote host — a real Claude Code session on a
+Rocky Linux box, reached over SSH, showed up correctly (including its real
+git branch/added/modified, confirming the Phase 2 collection-time guard
+works) once the `--json`/`--once` one-shot wait fix below was added.
 
 ## Summary
 
@@ -199,3 +203,30 @@ hold and one is broader than necessary:
     out most of the actual project name — accepted as the same kind of
     graceful truncation the rest of this panel already does, not a new
     failure mode.
+
+## Verified against a live host
+
+Tested against a real remote box (Rocky Linux, a live Claude Code session)
+over passwordless SSH: installed a user-level Rust toolchain there, built
+this branch from source, ran `abtop --json` non-interactively exactly as
+`RemoteCollector` does, then confirmed the session merged into a local
+`abtop --json` run tagged `"host": "trockysvr"` with its real git branch,
+added/modified counts, tokens, and model. This exercise found two real bugs:
+
+- **`--json`/`--once` never showed remote sessions on a fresh process.**
+  Both do exactly one tick and exit immediately, but a `RemoteCollector`
+  poll runs on a background thread and is only picked up on the *next*
+  `collect()` call — so a single-shot invocation always raced past the
+  first SSH round trip before it could land. Fixed with
+  `wait_for_remote_hosts` in `lib.rs`: re-ticks every 200ms (up to 10s, a
+  no-op when no hosts are configured) until every configured host has
+  reported at least once, success or failure, mirroring the existing
+  summary-wait loop `--once` already had for a different subsystem.
+- **The config file isn't at `~/.config/abtop/config.toml` on macOS** —
+  `dirs::config_dir()` resolves to `~/Library/Application Support/abtop/`
+  there (`~/.config` is a Linux-only XDG convention this crate doesn't
+  special-case). Pre-existing README inaccuracy, not something this
+  feature introduced, but this is exactly the kind of mistake a
+  `[[remote_hosts]]` block silently no-ops on (the file at the wrong path
+  is just never read, no error) — README now documents the actual path per
+  platform.

@@ -76,7 +76,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use std::io::{self, stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Construct a headless `App` from loaded config + theme. Shared by the
 /// `--json` and `--once` entry points.
@@ -88,6 +88,33 @@ fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
         &cfg.claude_config_dirs,
         &cfg.remote_hosts,
     )
+}
+
+/// A `RemoteCollector` poll runs on its own background thread and is
+/// checked on the next call to `collect()` — fine for the long-running TUI,
+/// which ticks every 2s regardless, but `--json`/`--once` do exactly one
+/// tick and exit immediately, so without this a freshly-started process
+/// would always report remote hosts as empty (the first poll simply
+/// wouldn't have landed yet). Re-ticks every 200ms until every configured
+/// host has reported at least once (success or failure) or `timeout`
+/// elapses; a no-op with no configured remote hosts.
+fn wait_for_remote_hosts_with_timeout(app: &mut App, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let still_pending = app
+            .remote_host_statuses()
+            .iter()
+            .any(|s| !s.reachable && s.last_error.is_none());
+        if !still_pending || Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        app.tick_no_summaries();
+    }
+}
+
+fn wait_for_remote_hosts(app: &mut App) {
+    wait_for_remote_hosts_with_timeout(app, Duration::from_secs(10));
 }
 
 pub fn run() -> io::Result<()> {
@@ -156,6 +183,7 @@ pub fn run() -> io::Result<()> {
             demo::populate_demo(&mut app);
         } else {
             app.tick_no_summaries();
+            wait_for_remote_hosts(&mut app);
         }
         match serde_json::to_string_pretty(&app.to_snapshot(2000)) {
             Ok(json) => {
@@ -176,6 +204,7 @@ pub fn run() -> io::Result<()> {
             demo::populate_demo(&mut app);
         } else {
             app.tick();
+            wait_for_remote_hosts(&mut app);
             // Wait for summaries: retry-aware budget (up to 30s total to allow 2 × 10s attempts + slack)
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             while std::time::Instant::now() < deadline {
@@ -604,5 +633,23 @@ mod tests {
         assert!(text.contains("cmux: socket broken; restart cmux"));
         assert!(!text.contains("Broken pipe"));
         assert!(!text.contains("select-workspace"));
+    }
+
+    #[test]
+    fn wait_for_remote_hosts_is_a_noop_with_no_remote_hosts_configured() {
+        // No remote_hosts means remote_host_statuses() is always empty, so
+        // this must return immediately rather than sleeping out the full
+        // timeout on every --json/--once invocation.
+        let mut app = App::new_with_config(
+            theme::Theme::default(),
+            &[],
+            config::PanelVisibility::default(),
+        );
+        let started = Instant::now();
+        wait_for_remote_hosts_with_timeout(&mut app, Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "should return immediately, not wait out the timeout"
+        );
     }
 }

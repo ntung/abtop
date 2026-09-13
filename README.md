@@ -92,7 +92,7 @@ OpenCode support reads the local SQLite database at `~/.local/share/opencode/ope
 
 ## Themes
 
-12 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
+12 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to the config file (see [Configuration](#configuration) for its path).
 
 | btop (default) | dracula | catppuccin |
 |:-:|:-:|:-:|
@@ -120,7 +120,17 @@ Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) 
 
 ## Configuration
 
-`~/.config/abtop/config.toml` supports:
+The config file lives wherever your platform keeps per-user config
+(resolved by the [`dirs`](https://docs.rs/dirs) crate) — notably **not**
+`~/.config` on macOS, unlike most CLI tools:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `~/.config/abtop/config.toml` |
+| macOS | `~/Library/Application Support/abtop/config.toml` |
+| Windows | `%APPDATA%\abtop\config.toml` |
+
+It supports:
 
 ```toml
 theme = "btop"
@@ -133,6 +143,16 @@ hidden_agents = ["codex"]
 claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
 # UI language. Omit or leave empty to auto-detect from LANG.
 language = "zh"
+
+# Monitor agent sessions on another machine over SSH. Requires `abtop`
+# installed on the remote host and passwordless (key/agent) SSH access —
+# abtop never prompts for a password. Repeat this block per host.
+[[remote_hosts]]
+name = "devbox"                  # shown as the "[devbox]" row prefix
+ssh_target = "devbox.internal"   # anything `ssh` accepts: host, user@host, or an ~/.ssh/config alias
+ssh_opts = ["-p", "2222"]        # optional extra ssh args
+poll_interval_secs = 10          # default 10
+allow_remote_kill = false        # reserved for a future release; kill/jump always no-op on remote sessions today
 ```
 
 ### Supported Languages
