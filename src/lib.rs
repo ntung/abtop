@@ -41,6 +41,7 @@
 //!     &cfg.hidden_agents,
 //!     cfg.panels,
 //!     &cfg.claude_config_dirs,
+//!     &cfg.remote_hosts,
 //! );
 //! loop {
 //!     app.tick_no_summaries();                // refresh without spawning `claude --print`
@@ -85,6 +86,7 @@ fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
         &cfg.hidden_agents,
         cfg.panels,
         &cfg.claude_config_dirs,
+        &cfg.remote_hosts,
     )
 }
 
@@ -196,15 +198,7 @@ pub fn run() -> io::Result<()> {
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(
-        &mut terminal,
-        demo_mode,
-        initial_theme,
-        exit_on_jump,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
-    );
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = if mouse_capture {
@@ -232,15 +226,14 @@ fn run_app(
     demo_mode: bool,
     initial_theme: Option<theme::Theme>,
     exit_on_jump: bool,
-    hidden_agents: &[String],
-    panels: config::PanelVisibility,
-    claude_config_dirs: &[std::path::PathBuf],
+    cfg: &config::AppConfig,
 ) -> io::Result<()> {
     let mut app = App::new_with_config_and_claude_dirs(
         initial_theme.unwrap_or_default(),
-        hidden_agents,
-        panels,
-        claude_config_dirs,
+        &cfg.hidden_agents,
+        cfg.panels,
+        &cfg.claude_config_dirs,
+        &cfg.remote_hosts,
     );
     if demo_mode {
         demo::populate_demo(&mut app);

@@ -141,19 +141,46 @@ hold and one is broader than necessary:
 
 ## Implementation phasing
 
-- **Phase 0 — wire contract.** Add `schema_version: u32` to `Snapshot`
-  (bump-and-check on parse). Add `host: Option<String>` to `AgentSession` and
-  `SessionView` (`None` = local); thread through `to_snapshot`.
-- **Phase 1 — config.** Add `[[remote_hosts]]` parsing per the schema above.
-  Decision needed: extend the hand-rolled parser vs. add a `toml` dependency.
-- **Phase 2 — `RemoteCollector`.** `src/collector/remote.rs`, implements
-  `AgentCollector`, one background thread per configured host running
-  `ssh -o ControlMaster=auto -o ControlPersist=60s ... abtop --once --json`
-  (or the slimmer flag from Phase 0b), caches last-good sessions +
-  `Unreachable` state, tags every session with `host`. Registered in
-  `MultiCollector::with_hidden_and_claude_config_dirs` alongside the existing
-  collectors, gated on `remote_hosts` being non-empty.
-- **Phase 3 — safety guards + UI.** Guard `kill_selected`,
-  `kill_orphan_ports`, `jump_to_selected` on `session.host.is_none()`. Add the
-  `[hostname]` row prefix and "stale, Ns ago" greying per the failure-handling
-  section above.
+- **Phase 0 — wire contract. Done.** Added `schema_version: u32` to
+  `Snapshot` and `host: Option<String>` to `AgentSession`/`SessionView`
+  (`None` = local), plus `AgentSession::is_local()`.
+- **Phase 1 — config. Done.** Extended the hand-rolled parser (not `toml`)
+  for `[[remote_hosts]]` — see `RemoteHostConfig` in `src/config.rs`.
+  `remote_hosts` is read-only from the app's perspective, so the
+  comment-preserving writer never needs to reproduce it.
+- **Phase 2 — `RemoteCollector`. Done.** `src/collector/remote.rs`, one
+  background thread per host, cached last-good sessions + reachability,
+  registered in `MultiCollector::with_hidden_and_claude_config_dirs` gated on
+  `remote_hosts` being non-empty. A few decisions landed differently than
+  this sketch originally proposed:
+  - **No new CLI flag.** `--json` (added independently of this design,
+    before Phase 0) already emits a fast, redacted, versioned snapshot with
+    no up-to-30s summary wait — reused as-is over SSH rather than inventing
+    `--once --json`.
+  - **A dedicated, narrower `Deserialize` DTO** (`RemoteSnapshotDto` /
+    `RemoteSessionDto` in `remote.rs`) parses the same JSON `--json` emits,
+    rather than adding `Deserialize` to the internal `Snapshot`/`SessionView`
+    types. Every field is `#[serde(default)]`, so an older/newer remote
+    `abtop` degrades field-by-field; `schema_version` is still checked
+    up front for a clear reject message. A few `AgentSession` fields aren't
+    on the wire at all (`context_history`, `mem_file_count`/`mem_line_count`,
+    `pending_since_ms`/`thinking_since_ms`, `file_accesses`) and are simply
+    defaulted empty/zero for remote sessions — reduced fidelity, not a bug.
+  - **The remote's precomputed `summary` string is reused as `initial_prompt`**
+    so `App::session_summary` shows it directly, and
+    `drain_and_retry_summaries`/`has_retryable_summaries` now gate on
+    `host.is_none()` — otherwise every remote session would get a second,
+    local `claude --print` summarization over the same text.
+  - **Two host guards landed in `MultiCollector::collect` itself, not
+    deferred to Phase 3**: local git-stats recomputation and orphan-port
+    tracking both now skip `host.is_some()` sessions. Without the first,
+    `git -C <remote cwd>` would run against a local path that doesn't exist
+    (or worse, one that does); without the second, a remote child's PID
+    could coincidentally collide with a live local PID and feed
+    `kill_orphan_ports`. Fixing both at collection time also means
+    `OrphanPort` never needs a `host` field, and `kill_orphan_ports` never
+    needs its own guard.
+- **Phase 3 — remaining safety guards + UI.** Guard `kill_selected` and
+  `jump_to_selected` on `session.host.is_none()` (`kill_orphan_ports` no
+  longer needs one — see above). Add the `[hostname]` row prefix and
+  "stale, Ns ago" greying, sourced from `RemoteCollector::host_statuses()`.

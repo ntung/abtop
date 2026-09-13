@@ -56,7 +56,7 @@ pub struct RateLimitInfo {
     pub updated_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionStatus {
     /// Model is generating a response (last_user_ts_ms > 0)
     Thinking,
@@ -79,7 +79,17 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl Default for SessionStatus {
+    /// Used when a `RemoteCollector` deserializes a session that's missing
+    /// (or fails to parse) its `status` field: "recent, but process
+    /// ownership not confirmed" is the closest existing meaning to "unknown
+    /// status from the wire."
+    fn default() -> Self {
+        SessionStatus::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChildProcess {
     pub pid: u32,
     pub command: String,

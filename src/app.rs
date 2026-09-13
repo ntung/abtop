@@ -158,7 +158,7 @@ impl App {
         hidden_agents: &[String],
         panels: crate::config::PanelVisibility,
     ) -> Self {
-        Self::new_with_config_and_claude_dirs(theme, hidden_agents, panels, &[])
+        Self::new_with_config_and_claude_dirs(theme, hidden_agents, panels, &[], &[])
     }
 
     pub fn new_with_config_and_claude_dirs(
@@ -166,11 +166,15 @@ impl App {
         hidden_agents: &[String],
         panels: crate::config::PanelVisibility,
         claude_config_dirs: &[PathBuf],
+        remote_hosts: &[crate::config::RemoteHostConfig],
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let summaries = load_summary_cache();
-        let mut collector =
-            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
+        let mut collector = MultiCollector::with_hidden_and_claude_config_dirs(
+            hidden_agents,
+            claude_config_dirs,
+            remote_hosts,
+        );
         collector.set_mcp_suppress(true);
         Self {
             sessions: Vec::new(),
@@ -579,7 +583,14 @@ impl App {
                 .get(&s.session_id)
                 .copied()
                 .unwrap_or(0);
-            let has_input = !s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty();
+            // Remote sessions (`host.is_some()`) reuse the remote's own
+            // already-computed summary as `initial_prompt` (see
+            // `RemoteSessionDto::into_agent_session`) purely so
+            // `session_summary` picks it up below — it must never be fed
+            // back into a *local* `claude --print` call, or every remote
+            // session would get summarized twice.
+            let has_input = s.host.is_none()
+                && (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty());
             if has_input
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
@@ -611,7 +622,8 @@ impl App {
     /// True if any session still qualifies for a summary retry.
     pub fn has_retryable_summaries(&self) -> bool {
         self.sessions.iter().any(|s| {
-            (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
+            s.host.is_none() // see the matching guard in drain_and_retry_summaries
+                && (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
                 && self

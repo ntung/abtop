@@ -4,12 +4,14 @@ pub mod mcp;
 pub mod opencode;
 pub mod process;
 pub mod rate_limit;
+pub mod remote;
 
 pub use claude::ClaudeCollector;
 pub use codex::CodexCollector;
 pub use mcp::McpServer;
 pub use opencode::OpenCodeCollector;
 pub use rate_limit::read_rate_limits;
+pub use remote::{RemoteCollector, RemoteHostStatus};
 
 /// Abbreviate a filesystem path by replacing the home directory prefix with `~`.
 pub(crate) fn abbrev_path(path: &std::path::Path) -> String {
@@ -315,12 +317,13 @@ impl MultiCollector {
     /// `agent_cli` name (e.g. `"claude"`, `"codex"`).
     #[cfg(test)]
     pub fn with_hidden(hidden: &[String]) -> Self {
-        Self::with_hidden_and_claude_config_dirs(hidden, &[])
+        Self::with_hidden_and_claude_config_dirs(hidden, &[], &[])
     }
 
     pub fn with_hidden_and_claude_config_dirs(
         hidden: &[String],
         claude_config_dirs: &[PathBuf],
+        remote_hosts: &[crate::config::RemoteHostConfig],
     ) -> Self {
         let is_hidden = |name: &str| hidden.iter().any(|h| h.eq_ignore_ascii_case(name));
         let mut collectors: Vec<Box<dyn AgentCollector>> = Vec::new();
@@ -334,6 +337,9 @@ impl MultiCollector {
         }
         if !is_hidden("opencode") {
             collectors.push(Box::new(OpenCodeCollector::new()));
+        }
+        if !remote_hosts.is_empty() {
+            collectors.push(Box::new(RemoteCollector::new(remote_hosts.to_vec())));
         }
         let codex_enabled = !is_hidden("codex");
         Self {
@@ -416,10 +422,19 @@ impl MultiCollector {
             all.extend(collector.collect(&shared));
         }
 
-        // Git stats: refresh only on slow tick
+        // Git stats: refresh only on slow tick. `s.cwd` is a path on
+        // whichever machine collected `s` — for a remote session (`host` is
+        // `Some`) that's a path on the *remote* host, so `git -C <cwd>`
+        // here would run against a local path that doesn't exist (or, worse,
+        // happens to exist and belongs to something unrelated). Remote
+        // sessions already carry git stats computed on their own host by
+        // the remote `abtop --json`; leave those alone.
         if slow_tick {
             self.cached_git.clear();
             for s in &mut all {
+                if s.host.is_some() {
+                    continue;
+                }
                 let stats = process::collect_git_stats(&s.cwd);
                 self.cached_git.insert(s.cwd.clone(), stats);
                 s.git_added = stats.0;
@@ -427,6 +442,9 @@ impl MultiCollector {
             }
         } else {
             for s in &mut all {
+                if s.host.is_some() {
+                    continue;
+                }
                 if let Some(&(added, modified)) = self.cached_git.get(&s.cwd) {
                     s.git_added = added;
                     s.git_modified = modified;
@@ -445,9 +463,19 @@ impl MultiCollector {
         all.sort_by_key(|s| std::cmp::Reverse(s.started_at));
 
         // --- Orphan port detection ---
-        // 1. Update tracked port children from live sessions
+        // 1. Update tracked port children from live sessions. Remote
+        // sessions are excluded: PIDs are only unique per host, and
+        // `shared.ports`/`shared.process_info` below are local-only
+        // `ps`/`lsof` scans, so a remote child's PID checked against them
+        // is at best meaningless and at worst a coincidental collision with
+        // an unrelated local process — which `kill_orphan_ports` could then
+        // act on. Remote ports are shown informationally on the session
+        // detail view instead; they never enter local orphan tracking.
         let mut live_child_pids = std::collections::HashSet::new();
         for s in &all {
+            if s.host.is_some() {
+                continue;
+            }
             if !matches!(s.status, SessionStatus::Done) {
                 for child in &s.children {
                     live_child_pids.insert(child.pid);
