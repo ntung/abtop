@@ -673,6 +673,7 @@ impl CodexCollector {
                         .parent()
                         .unwrap_or(std::path::Path::new(".")),
                 ),
+                host: None,
             },
             rate_limit,
         ))

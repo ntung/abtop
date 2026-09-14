@@ -234,6 +234,7 @@ impl OpenCodeCollector {
                 config_root: super::abbrev_path(
                     self.db_path.parent().unwrap_or(std::path::Path::new(".")),
                 ),
+                host: None,
             });
         }
 

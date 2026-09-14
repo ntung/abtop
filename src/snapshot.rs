@@ -20,9 +20,17 @@ use crate::model::{
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Wire schema version of [`Snapshot`]. Bump on any breaking field
+/// removal/rename so a consumer (e.g. a `RemoteCollector` parsing another
+/// host's `--json` output) can reject a mismatched version with a clear
+/// error instead of failing serde deserialization opaquely.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// Top-level snapshot returned by [`App::to_snapshot`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
+    /// Wire schema version; see [`SCHEMA_VERSION`].
+    pub schema_version: u32,
     /// Unix-epoch milliseconds when this snapshot was built.
     pub generated_at_ms: u64,
     /// Host vitals (CPU / mem / load1). `None` on unsupported platforms or
@@ -85,6 +93,9 @@ pub struct SubAgentView {
 /// A single session, flattened and curated for JSON consumers.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionView {
+    /// Host this session was collected from (`[[remote_hosts]].name` in
+    /// config.toml). `None` for sessions collected on the local machine.
+    pub host: Option<String>,
     /// Owning CLI: "claude", "codex", "opencode".
     pub agent_cli: &'static str,
     /// Which surface launched this session (CLI / Claude desktop app / IDE
@@ -205,6 +216,7 @@ impl App {
             .sessions
             .iter()
             .map(|s| SessionView {
+                host: s.host.clone(),
                 agent_cli: s.agent_cli,
                 launch_surface: s.launch_surface,
                 pid: s.pid,
@@ -279,6 +291,7 @@ impl App {
             .collect();
 
         Snapshot {
+            schema_version: SCHEMA_VERSION,
             generated_at_ms: epoch_ms(now).unwrap_or(0),
             host: self.host_metrics,
             aggregate: self.agent_aggregate,
@@ -316,6 +329,24 @@ mod tests {
         assert_eq!(tail(&v, 9), vec![1, 2, 3, 4, 5]); // n > len → full clone
         assert_eq!(tail(&v, 0), Vec::<i32>::new()); // n = 0 → empty
         assert_eq!(tail(&Vec::<i32>::new(), 3), Vec::<i32>::new()); // empty input
+    }
+
+    #[test]
+    fn to_snapshot_stamps_current_schema_version() {
+        // A RemoteCollector parsing another host's `--json` output checks
+        // this before trusting the rest of the payload.
+        let snap = demo_app().to_snapshot(2_000);
+        assert_eq!(snap.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn to_snapshot_local_sessions_have_no_host() {
+        // demo/local sessions must serialize `host: null`, matching
+        // `AgentSession::is_local()`; a RemoteCollector is the only producer
+        // of `Some(host)` sessions.
+        let snap = demo_app().to_snapshot(2_000);
+        assert!(!snap.sessions.is_empty());
+        assert!(snap.sessions.iter().all(|s| s.host.is_none()));
     }
 
     #[test]

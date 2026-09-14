@@ -25,6 +25,40 @@ impl Default for PanelVisibility {
     }
 }
 
+/// One `[[remote_hosts]]` block: an SSH-reachable host to poll for remote
+/// session monitoring (see docs/design/remote-ssh-monitoring.md). Read-only
+/// config — nothing in the app writes this back, so `write_with_updates`'s
+/// comment/unknown-key preservation never needs to reproduce it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoteHostConfig {
+    /// Display name, e.g. "devbox". Used as the `host` tag on remote
+    /// sessions and must be non-empty for the entry to be kept.
+    pub name: String,
+    /// `ssh` destination, e.g. "devbox.internal" or "user@host". Must be
+    /// non-empty for the entry to be kept.
+    pub ssh_target: String,
+    /// Extra arguments passed to `ssh` verbatim, e.g. `["-p", "2222"]`.
+    pub ssh_opts: Vec<String>,
+    /// How often to poll this host, in seconds.
+    pub poll_interval_secs: u64,
+    /// Whether `x`/`X` kill actions may target this host's sessions/ports.
+    /// Defaults to `false`: SIGKILL over SSH on a box you don't locally
+    /// control is a materially different risk than local kill.
+    pub allow_remote_kill: bool,
+}
+
+impl Default for RemoteHostConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            ssh_target: String::new(),
+            ssh_opts: Vec::new(),
+            poll_interval_secs: 10,
+            allow_remote_kill: false,
+        }
+    }
+}
+
 pub struct AppConfig {
     pub theme: String,
     /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
@@ -37,6 +71,9 @@ pub struct AppConfig {
     /// UI language override. Empty string means auto-detect from `LANG`.
     /// Recognized values: "en", "zh" (anything starting with "zh" maps to Simplified Chinese).
     pub language: String,
+    /// SSH-reachable hosts to poll for remote session monitoring, from
+    /// `[[remote_hosts]]` blocks. Empty unless configured.
+    pub remote_hosts: Vec<RemoteHostConfig>,
 }
 
 impl Default for AppConfig {
@@ -47,6 +84,7 @@ impl Default for AppConfig {
             claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
             language: String::new(),
+            remote_hosts: Vec::new(),
         }
     }
 }
@@ -71,20 +109,48 @@ pub fn load_config() -> AppConfig {
 
 fn parse_config_body(content: &str) -> AppConfig {
     let mut config = AppConfig::default();
+    // `true` while inside a `[[remote_hosts]]` block, i.e. until the next
+    // table header (of any kind) or EOF — same scoping TOML itself uses for
+    // array-of-tables. There's exactly one supported table shape today, so
+    // this is a bool rather than a general section stack.
+    let mut in_remote_host = false;
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
+        // Strip inline comments up front so table headers (no `=`) get the
+        // same `# comment` handling as key/value lines below.
+        let line = match line.find('#') {
+            Some(pos) => line[..pos].trim(),
+            None => line,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(inner) = line.strip_prefix("[[").and_then(|s| s.strip_suffix("]]")) {
+            in_remote_host = inner.trim() == "remote_hosts";
+            if in_remote_host {
+                config.remote_hosts.push(RemoteHostConfig::default());
+            }
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            // Any other (currently unsupported) table header ends the
+            // remote_hosts block rather than letting its keys leak in.
+            in_remote_host = false;
+            continue;
+        }
         if let Some((key, val)) = line.split_once('=') {
             let key = key.trim();
-            // Strip quotes (double or single) and inline comments
             let val = val.trim();
-            let val = if let Some(comment_pos) = val.find('#') {
-                val[..comment_pos].trim()
-            } else {
-                val
-            };
+            if in_remote_host {
+                // `push` above guarantees a current entry whenever this flag is set.
+                if let Some(host) = config.remote_hosts.last_mut() {
+                    apply_remote_host_key(host, key, val);
+                }
+                continue;
+            }
             if key == "hidden_agents" {
                 config.hidden_agents = parse_string_array(val);
                 continue;
@@ -108,7 +174,37 @@ fn parse_config_body(content: &str) -> AppConfig {
             }
         }
     }
+    // Drop entries missing a name or ssh_target — nothing downstream can
+    // address a host without both, and config loading must stay infallible
+    // rather than surface a parse error for a malformed block.
     config
+        .remote_hosts
+        .retain(|h| !h.name.is_empty() && !h.ssh_target.is_empty());
+    config
+}
+
+/// Apply one `key = value` line from inside a `[[remote_hosts]]` block.
+/// Unknown keys are ignored (defensive parsing, matches the top-level
+/// parser's behavior for forward/backward config compatibility).
+fn apply_remote_host_key(host: &mut RemoteHostConfig, key: &str, val: &str) {
+    if key == "ssh_opts" {
+        host.ssh_opts = parse_string_array(val);
+        return;
+    }
+    let quoted = val.trim_matches('"').trim_matches('\'');
+    match key {
+        "name" => host.name = quoted.to_string(),
+        "ssh_target" => host.ssh_target = quoted.to_string(),
+        "poll_interval_secs" => {
+            if let Ok(secs) = val.trim().parse::<u64>() {
+                host.poll_interval_secs = secs;
+            }
+        }
+        "allow_remote_kill" => {
+            host.allow_remote_kill = parse_bool(val).unwrap_or(false);
+        }
+        _ => {}
+    }
 }
 
 fn parse_bool(raw: &str) -> Option<bool> {
@@ -218,6 +314,122 @@ fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_config_body_reads_a_full_remote_host_block() {
+        let cfg = parse_config_body(
+            r#"
+[[remote_hosts]]
+name = "devbox"
+ssh_target = "devbox.internal"
+ssh_opts = ["-p", "2222"]
+poll_interval_secs = 30
+allow_remote_kill = true
+"#,
+        );
+        assert_eq!(
+            cfg.remote_hosts,
+            vec![RemoteHostConfig {
+                name: "devbox".into(),
+                ssh_target: "devbox.internal".into(),
+                ssh_opts: vec!["-p".into(), "2222".into()],
+                poll_interval_secs: 30,
+                allow_remote_kill: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_config_body_applies_remote_host_defaults_for_omitted_keys() {
+        // poll_interval_secs and allow_remote_kill are safety/perf defaults
+        // (10s poll, kill disabled) when a block doesn't set them.
+        let cfg = parse_config_body(
+            r#"
+[[remote_hosts]]
+name = "devbox"
+ssh_target = "devbox.internal"
+"#,
+        );
+        let host = &cfg.remote_hosts[0];
+        assert_eq!(host.poll_interval_secs, 10);
+        assert!(!host.allow_remote_kill);
+        assert!(host.ssh_opts.is_empty());
+    }
+
+    #[test]
+    fn parse_config_body_reads_multiple_remote_host_blocks() {
+        let cfg = parse_config_body(
+            r#"
+[[remote_hosts]]
+name = "devbox"
+ssh_target = "devbox.internal"
+
+[[remote_hosts]]
+name = "gpu-box"
+ssh_target = "gpu.internal"
+"#,
+        );
+        assert_eq!(cfg.remote_hosts.len(), 2);
+        assert_eq!(cfg.remote_hosts[0].name, "devbox");
+        assert_eq!(cfg.remote_hosts[1].name, "gpu-box");
+    }
+
+    #[test]
+    fn parse_config_body_drops_remote_host_missing_required_fields() {
+        // A block missing `name` or `ssh_target` can't be addressed by
+        // anything downstream, so it's dropped rather than kept half-formed.
+        let cfg = parse_config_body(
+            r#"
+[[remote_hosts]]
+ssh_target = "devbox.internal"
+
+[[remote_hosts]]
+name = "no-target"
+"#,
+        );
+        assert!(cfg.remote_hosts.is_empty());
+    }
+
+    #[test]
+    fn parse_config_body_ignores_inline_comment_on_table_header() {
+        let cfg = parse_config_body(
+            r#"
+[[remote_hosts]] # my dev box
+name = "devbox"
+ssh_target = "devbox.internal"
+"#,
+        );
+        assert_eq!(cfg.remote_hosts.len(), 1);
+    }
+
+    #[test]
+    fn parse_config_body_keeps_top_level_keys_working_alongside_remote_hosts() {
+        let cfg = parse_config_body(
+            r#"
+theme = "dracula"
+[[remote_hosts]]
+name = "devbox"
+ssh_target = "devbox.internal"
+"#,
+        );
+        assert_eq!(cfg.theme, "dracula");
+        assert_eq!(cfg.remote_hosts.len(), 1);
+    }
+
+    #[test]
+    fn rewrite_kv_lines_leaves_a_remote_hosts_block_untouched() {
+        // remote_hosts is read-only from the app's perspective (only ever
+        // hand-edited); a save_* call for an unrelated key must not mangle it.
+        let before = "theme = \"btop\"\n[[remote_hosts]]\nname = \"devbox\"\nssh_target = \"devbox.internal\"\n";
+        let after = rewrite_kv_lines(before, &theme_update("nord"));
+        assert!(after.contains("[[remote_hosts]]"));
+        assert!(after.contains("name = \"devbox\""));
+        assert!(after.contains("ssh_target = \"devbox.internal\""));
+        assert!(after.contains("theme = \"nord\""));
+        // And the rewritten body still parses back to the same host.
+        let cfg = parse_config_body(&after);
+        assert_eq!(cfg.remote_hosts[0].name, "devbox");
+    }
 
     #[test]
     fn parse_string_array_basic() {

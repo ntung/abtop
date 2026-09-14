@@ -127,11 +127,27 @@ pub(crate) fn draw_sessions_panel_active(
     };
     let tokens_w: u16 = if w >= 100 { 7 } else { 5 };
 
+    // Per-host reachability for the `[host]` row prefix / stale-row
+    // treatment below. Looked up by name rather than carried inline on
+    // AgentSession because reachability is host-level, not session-level,
+    // and changes independently of any one session's own data.
+    let remote_statuses = app.remote_host_statuses();
+    let remote_by_name: std::collections::HashMap<&str, &crate::collector::RemoteHostStatus> =
+        remote_statuses
+            .iter()
+            .map(|s| (s.name.as_str(), s))
+            .collect();
+
     let visible = app.visible_indices();
     for &i in &visible {
         let session = &app.sessions[i];
         let selected = i == app.selected;
         let marker = if selected { "►" } else { " " };
+        let remote_status = session
+            .host
+            .as_deref()
+            .and_then(|h| remote_by_name.get(h).copied());
+        let is_stale = remote_status.is_some_and(|s| !s.reachable);
 
         let (agent_base, agent_color) = match session.agent_cli {
             "claude" => ("*CC", Color::Rgb(217, 119, 87)), // #D97757 terracotta
@@ -168,7 +184,10 @@ pub(crate) fn draw_sessions_panel_active(
                 .bg(theme.selected_bg)
                 .fg(theme.selected_fg)
                 .add_modifier(Modifier::BOLD)
-        } else if is_done {
+        } else if is_done || is_stale {
+            // A stale remote row (host unreachable, showing last-known-good
+            // data) gets the same dimming as a finished session — it's
+            // "not current," same as Done, for different reasons.
             Style::default().fg(theme.inactive_fg)
         } else {
             Style::default()
@@ -193,8 +212,12 @@ pub(crate) fn draw_sessions_panel_active(
             )));
         }
         cells.push(Cell::from(Span::styled(
-            truncate_str(&session.project_name, project_w as usize),
-            Style::default().fg(theme.title),
+            truncate_str(&project_display_name(session), project_w as usize),
+            Style::default().fg(if is_stale {
+                theme.inactive_fg
+            } else {
+                theme.title
+            }),
         )));
         if show_session_id {
             cells.push(Cell::from(Span::styled(
@@ -267,14 +290,23 @@ pub(crate) fn draw_sessions_panel_active(
             + show_tokens as usize
             + show_memory as usize
             + show_turn as usize;
+        // A stale remote row replaces the normal task line with how long
+        // ago the host was last reachable — the task text itself is
+        // last-known-good and would otherwise look like live status.
+        let stale_task_text = remote_stale_task_text(
+            is_stale,
+            remote_status.and_then(|s| s.seconds_since_success),
+        );
         let task_cells: Vec<Cell> = (0..total_cols)
             .map(|j| {
                 if j == summary_idx {
-                    let task_text = session
-                        .current_tasks
-                        .last()
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
+                    let task_text = stale_task_text.as_deref().unwrap_or_else(|| {
+                        session
+                            .current_tasks
+                            .last()
+                            .map(|s| s.as_str())
+                            .unwrap_or("")
+                    });
                     Cell::from(Span::styled(
                         task_row_text(task_text, w.saturating_sub(24) as usize),
                         Style::default().fg(theme.graph_text),
@@ -991,6 +1023,28 @@ fn task_row_text(task_text: &str, max_width: usize) -> String {
     truncate_str(&format!("└─ {task_text}"), max_width)
 }
 
+/// Project-column text for a session: `[host] project` when it was
+/// collected remotely, else just `project`.
+fn project_display_name(session: &AgentSession) -> String {
+    match &session.host {
+        Some(host) => format!("[{host}] {}", session.project_name),
+        None => session.project_name.clone(),
+    }
+}
+
+/// Task-line text for a remote session whose host is currently unreachable
+/// — `None` for a local session, or a remote one that's currently
+/// reachable, in which case the caller shows the normal task text instead.
+fn remote_stale_task_text(is_stale: bool, seconds_since_success: Option<u64>) -> Option<String> {
+    if !is_stale {
+        return None;
+    }
+    Some(match seconds_since_success {
+        Some(secs) => format!("stale, {secs}s ago"),
+        None => "unreachable".to_string(),
+    })
+}
+
 pub(crate) fn shorten_model(model: &str, is_1m: bool) -> String {
     // "claude-opus-4-6" → "opus4.6", "claude-sonnet-4-6" → "sonnet4.6", "claude-haiku-4-5" → "haiku4.5"
     let s = model.strip_prefix("claude-").unwrap_or(model);
@@ -1316,6 +1370,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            host: None,
         });
 
         let backend = TestBackend::new(120, 20);
@@ -1477,6 +1532,72 @@ mod tests {
         assert_eq!(buffer[(1, 4)].symbol(), "►");
     }
 
+    #[test]
+    fn session_table_prefixes_remote_sessions_with_host() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut remote = test_session("remote11", "widgets");
+        remote.host = Some("devbox".to_string());
+        app.sessions = vec![test_session("local111", "abtop"), remote];
+
+        let backend = TestBackend::new(120, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 14,
+        };
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, area, &app.theme))
+            .unwrap();
+
+        let text = format!("{}", terminal.backend());
+        // The project column is narrow (8-14 chars depending on width) and
+        // truncates like everything else in this panel — "[devbox]" is what
+        // actually fits here, the project name itself often doesn't. See
+        // `project_display_name_prefixes_host_only_for_remote_sessions`
+        // below for the untruncated mapping.
+        assert!(
+            text.contains("[devbox]"),
+            "remote session should show its host prefix\n{text}"
+        );
+        assert!(
+            text.contains("abtop") && !text.contains("] abtop"),
+            "local session's project name should render unprefixed\n{text}"
+        );
+    }
+
+    #[test]
+    fn project_display_name_prefixes_host_only_for_remote_sessions() {
+        let mut session = test_session("s", "abtop");
+        assert_eq!(project_display_name(&session), "abtop");
+
+        session.host = Some("devbox".to_string());
+        assert_eq!(project_display_name(&session), "[devbox] abtop");
+    }
+
+    #[test]
+    fn remote_stale_task_text_is_none_when_not_stale() {
+        assert_eq!(remote_stale_task_text(false, Some(30)), None);
+        assert_eq!(remote_stale_task_text(false, None), None);
+    }
+
+    #[test]
+    fn remote_stale_task_text_reports_seconds_since_success() {
+        assert_eq!(
+            remote_stale_task_text(true, Some(42)),
+            Some("stale, 42s ago".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_stale_task_text_reports_never_reachable() {
+        assert_eq!(
+            remote_stale_task_text(true, None),
+            Some("unreachable".to_string())
+        );
+    }
+
     fn test_session(session_id: &str, project_name: &str) -> AgentSession {
         AgentSession {
             agent_cli: "claude",
@@ -1517,6 +1638,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: "~/.claude".into(),
+            host: None,
         }
     }
 }

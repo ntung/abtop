@@ -1,0 +1,232 @@
+# Design: Remote/SSH session monitoring
+
+Status: implemented on `feat/remote-ssh-monitoring` (all four phases below)
+and verified against a live remote host — a real Claude Code session on a
+Rocky Linux box, reached over SSH, showed up correctly (including its real
+git branch/added/modified, confirming the Phase 2 collection-time guard
+works) once the `--json`/`--once` one-shot wait fix below was added.
+
+## Summary
+
+Add optional SSH-based monitoring of `abtop`-supported agent sessions (Claude
+Code, Codex CLI, OpenCode) running on remote hosts, e.g. a dev box reached via
+SSH. Today this is out of scope: the whole collection pipeline (`ps`/`lsof`/
+filesystem reads) is local-only by design.
+
+## Proposed approach
+
+Rather than abstracting every `ps`/`lsof`/filesystem call in
+`collector/process.rs`, `collector/claude.rs`, `collector/codex.rs`,
+`collector/opencode.rs` behind a remote-capable backend trait (a large, risky
+refactor, and wasteful on the wire — it would mean shipping raw multi-MB
+JSONL transcripts over SSH just to re-parse them locally), reuse the fact
+that `abtop` already has a complete, correct local collection pipeline via
+its `--once` snapshot mode:
+
+> Remote monitoring = run `abtop --once --json` *on the remote host* over
+> SSH, parse its output, tag it with a hostname, and merge it into the local
+> session list.
+
+### New pieces
+
+**1. `abtop --once --json` output contract**
+- New flag alongside existing `--once`. Emits a slim, versioned DTO (not the
+  raw `AgentSession`, to decouple wire format from internal refactors):
+  ```rust
+  struct RemoteSnapshot {
+      schema_version: u32,
+      sessions: Vec<RemoteSessionDto>,
+      orphan_ports: Vec<OrphanPort>,
+      rate_limits: Vec<RateLimitInfo>,
+  }
+  ```
+- Reuses the existing `--once` redaction path (tool_use inputs already
+  reduced to "tool name + file path", per the Privacy section of AGENTS.md)
+  — no new redaction logic needed; secrets never hit the wire.
+
+**2. `src/collector/remote.rs` — `RemoteCollector: AgentCollector`**
+- Config-driven host list in `~/.config/abtop/config.toml`:
+  ```toml
+  [[remote_hosts]]
+  name = "devbox"
+  ssh_target = "devbox.internal"   # or user@host
+  ssh_opts = ["-p", "2222"]
+  poll_interval_secs = 10
+  allow_remote_kill = false        # see risks below
+  ```
+- Must not block the 2s tick loop: SSH round trips (auth handshake + remote
+  `ps`/`lsof`/JSONL scan) can take hundreds of ms to seconds. Each host polls
+  on its own background thread (same idiom already used for `claude --print`
+  summary generation: background process + timeout, capped concurrency),
+  writing into a shared cache that the main tick reads without blocking.
+- SSH multiplexing is effectively required, not optional:
+  `-o ControlMaster=auto -o ControlPersist=60s -o ControlPath=...` so
+  repeated polls reuse one authenticated connection instead of a full
+  handshake every poll.
+
+**3. Model change**: add `host: Option<String>` to `AgentSession` (`None` =
+local; existing fixtures/tests unaffected). UI prefixes remote rows, e.g.
+`[devbox] CC 7336 ...`.
+
+**4. Identity fix**: PIDs are only unique per host. Anywhere sessions are
+currently keyed/selected/killed by `pid` alone (selection state, kill
+action, orphan-port tracking) needs to become keyed by `(host, pid)` — this
+is the one change that touches existing code paths rather than being purely
+additive.
+
+### Failure handling (mirrors existing staleness/heuristic conventions in AGENTS.md)
+- Unreachable host / auth failure → mark `Unreachable`, backoff, don't retry
+  faster than `poll_interval_secs`; show stale cached rows grayed out
+  ("stale, Ns ago") rather than blanking them immediately.
+- Remote `abtop` missing or schema mismatch → `schema_version` checked
+  before parse; clear error message instead of a serde panic.
+- Clock skew across hosts → compute "last seen" from local receipt time, not
+  the remote's absolute timestamps.
+
+### Deliberately out of scope for v1
+- Kill (`x`/`X`) on remote sessions/ports: default-disabled
+  (`allow_remote_kill = false`) — SIGKILL over SSH on a box you don't
+  locally control is a materially different risk than the existing local
+  safety-checked kill.
+- tmux jump (`Enter`) for remote sessions: would need
+  `ssh -t host tmux select-pane`; changes the meaning of "jump," left for a
+  follow-up.
+- Streaming/push: stick to the existing poll-tier model, just add a slower
+  "remote" tier (~10-30s) given network cost.
+
+## Trade-offs to flag explicitly
+
+This is a genuine scope change from today's design, which is intentionally
+local-only, network-free, and auth-free ("No network, no auth" — Privacy /
+Data Sources sections of AGENTS.md). This proposal introduces SSH as a real
+dependency: connectivity, key/agent auth, and requiring `abtop` installed on
+the remote host. Worth deciding deliberately rather than as a side effect of
+an unrelated change.
+
+## Benefit vs. cost
+
+Nearly all new code is additive (one flag, one collector module, one config
+block, one model field); the existing 3990-line `claude.rs` and friends stay
+untouched.
+
+## Corrections against the current codebase (2026-09)
+
+The sketch above predates a look at the actual code. Two assumptions don't
+hold and one is broader than necessary:
+
+1. **`--once`/`--json` already exist**, as two separate flags — `--json`
+   alone already prints the full `Snapshot`/`SessionView` (`src/snapshot.rs`),
+   richer than the slim `RemoteSnapshot` sketched above (it includes chat
+   tails, tool calls, subagents). There is no `schema_version` field today.
+   So "piece 1" isn't new; it's (a) add `schema_version: u32` to `Snapshot`,
+   and (b) decide whether `RemoteCollector` consumes the existing rich
+   `Snapshot` as-is, or a new slimmer DTO behind its own flag so chat/tool
+   tails aren't shipped over SSH by default.
+2. **Config parsing (`src/config.rs`) is a hand-rolled line-by-line
+   `key = value` parser**, not a TOML crate — no support for
+   `[[remote_hosts]]` array-of-tables today. Adding it means either
+   extending the hand-rolled parser for this one nested shape, or pulling in
+   a real `toml`/`toml_edit` dependency. This repo has never needed a real
+   TOML dependency before; worth deciding deliberately.
+3. **The "keyed by (host, pid)" identity fix is narrower than it sounds.**
+   Pid-keyed caches in `collector/mod.rs` (`cached_ports`,
+   `tracked_port_children`, `cached_port_pids`) are local-scan-only and never
+   touched by remote data — remote ports/orphans arrive pre-computed from the
+   remote `abtop --once`, so those maps stay pid-only. The part that actually
+   needs `(host, pid)` awareness is narrower and sharper: `kill_selected`,
+   `kill_orphan_ports`, and `jump_to_selected` in `app.rs` (lines ~710/758/801)
+   shell out `ps -p <pid>` / `kill -9 <pid>` against whatever pid sits in
+   `AgentSession.pid`, with **no check on origin today**. Once remote sessions
+   with foreign pids sit in `self.sessions`, `allow_remote_kill = false` in
+   config isn't sufficient on its own — those three call sites must explicitly
+   bail when `session.host.is_some()`, or a remote pid that happens to collide
+   with a real local killable-agent pid gets SIGKILLed locally. Treat this as
+   a correctness/safety must-fix, not a nice-to-have.
+
+## Implementation phasing
+
+- **Phase 0 — wire contract. Done.** Added `schema_version: u32` to
+  `Snapshot` and `host: Option<String>` to `AgentSession`/`SessionView`
+  (`None` = local), plus `AgentSession::is_local()`.
+- **Phase 1 — config. Done.** Extended the hand-rolled parser (not `toml`)
+  for `[[remote_hosts]]` — see `RemoteHostConfig` in `src/config.rs`.
+  `remote_hosts` is read-only from the app's perspective, so the
+  comment-preserving writer never needs to reproduce it.
+- **Phase 2 — `RemoteCollector`. Done.** `src/collector/remote.rs`, one
+  background thread per host, cached last-good sessions + reachability,
+  registered in `MultiCollector::with_hidden_and_claude_config_dirs` gated on
+  `remote_hosts` being non-empty. A few decisions landed differently than
+  this sketch originally proposed:
+  - **No new CLI flag.** `--json` (added independently of this design,
+    before Phase 0) already emits a fast, redacted, versioned snapshot with
+    no up-to-30s summary wait — reused as-is over SSH rather than inventing
+    `--once --json`.
+  - **A dedicated, narrower `Deserialize` DTO** (`RemoteSnapshotDto` /
+    `RemoteSessionDto` in `remote.rs`) parses the same JSON `--json` emits,
+    rather than adding `Deserialize` to the internal `Snapshot`/`SessionView`
+    types. Every field is `#[serde(default)]`, so an older/newer remote
+    `abtop` degrades field-by-field; `schema_version` is still checked
+    up front for a clear reject message. A few `AgentSession` fields aren't
+    on the wire at all (`context_history`, `mem_file_count`/`mem_line_count`,
+    `pending_since_ms`/`thinking_since_ms`, `file_accesses`) and are simply
+    defaulted empty/zero for remote sessions — reduced fidelity, not a bug.
+  - **The remote's precomputed `summary` string is reused as `initial_prompt`**
+    so `App::session_summary` shows it directly, and
+    `drain_and_retry_summaries`/`has_retryable_summaries` now gate on
+    `host.is_none()` — otherwise every remote session would get a second,
+    local `claude --print` summarization over the same text.
+  - **Two host guards landed in `MultiCollector::collect` itself, not
+    deferred to Phase 3**: local git-stats recomputation and orphan-port
+    tracking both now skip `host.is_some()` sessions. Without the first,
+    `git -C <remote cwd>` would run against a local path that doesn't exist
+    (or worse, one that does); without the second, a remote child's PID
+    could coincidentally collide with a live local PID and feed
+    `kill_orphan_ports`. Fixing both at collection time also means
+    `OrphanPort` never needs a `host` field, and `kill_orphan_ports` never
+    needs its own guard.
+- **Phase 3 — remaining safety guards + UI. Done.**
+  - `kill_selected` and `jump_to_session` (`App`) now bail with a status
+    message naming the host when `session.host.is_some()`, rather than
+    acting on a PID that's only meaningful on another machine
+    (`kill_orphan_ports` needed no guard — see the Phase 2 note above).
+  - `MultiCollector` holds its `RemoteCollector` in its own field (not
+    type-erased into the generic `collectors: Vec<Box<dyn AgentCollector>>`)
+    specifically so `remote_host_statuses()` can be queried directly for the
+    UI, without downcasting a trait object.
+  - Sessions panel (`ui/sessions.rs`): the project column shows `[host]
+    project` for a remote session (`project_display_name`); a session whose
+    host is currently unreachable gets the same dimming as a Done session,
+    and its task line is replaced with `stale, Ns ago` / `unreachable`
+    (`remote_stale_task_text`) instead of showing last-known-good task text
+    as if it were live. Note: the project column is only 8-14 chars
+    depending on terminal width, so on a narrow terminal `[host]` can crowd
+    out most of the actual project name — accepted as the same kind of
+    graceful truncation the rest of this panel already does, not a new
+    failure mode.
+
+## Verified against a live host
+
+Tested against a real remote box (Rocky Linux, a live Claude Code session)
+over passwordless SSH: installed a user-level Rust toolchain there, built
+this branch from source, ran `abtop --json` non-interactively exactly as
+`RemoteCollector` does, then confirmed the session merged into a local
+`abtop --json` run tagged `"host": "trockysvr"` with its real git branch,
+added/modified counts, tokens, and model. This exercise found two real bugs:
+
+- **`--json`/`--once` never showed remote sessions on a fresh process.**
+  Both do exactly one tick and exit immediately, but a `RemoteCollector`
+  poll runs on a background thread and is only picked up on the *next*
+  `collect()` call — so a single-shot invocation always raced past the
+  first SSH round trip before it could land. Fixed with
+  `wait_for_remote_hosts` in `lib.rs`: re-ticks every 200ms (up to 10s, a
+  no-op when no hosts are configured) until every configured host has
+  reported at least once, success or failure, mirroring the existing
+  summary-wait loop `--once` already had for a different subsystem.
+- **The config file isn't at `~/.config/abtop/config.toml` on macOS** —
+  `dirs::config_dir()` resolves to `~/Library/Application Support/abtop/`
+  there (`~/.config` is a Linux-only XDG convention this crate doesn't
+  special-case). Pre-existing README inaccuracy, not something this
+  feature introduced, but this is exactly the kind of mistake a
+  `[[remote_hosts]]` block silently no-ops on (the file at the wrong path
+  is just never read, no error) — README now documents the actual path per
+  platform.

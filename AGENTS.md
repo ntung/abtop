@@ -30,7 +30,8 @@ src/
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
-│   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
+│   ├── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
+│   └── remote.rs           # Remote/SSH: polls `abtop --json` on [[remote_hosts]] entries
 └── model/
     ├── mod.rs              # Re-exports
     └── session.rs          # AgentSession, SessionStatus, RateLimitInfo,
@@ -348,8 +349,11 @@ cargo clippy                   # Lint
 
 - Gemini/Cursor support
 - Cost estimation
-- Remote/SSH monitoring
 - Notifications/alerts
+
+Remote/SSH monitoring (`[[remote_hosts]]` in config.toml) was a v0.1
+non-goal but has since shipped — see `src/collector/remote.rs` and
+`docs/design/remote-ssh-monitoring.md`.
 
 ## Terminal Jump (`Enter`)
 

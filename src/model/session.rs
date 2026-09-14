@@ -56,7 +56,7 @@ pub struct RateLimitInfo {
     pub updated_at: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionStatus {
     /// Model is generating a response (last_user_ts_ms > 0)
     Thinking,
@@ -79,7 +79,17 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+impl Default for SessionStatus {
+    /// Used when a `RemoteCollector` deserializes a session that's missing
+    /// (or fails to parse) its `status` field: "recent, but process
+    /// ownership not confirmed" is the closest existing meaning to "unknown
+    /// status from the wire."
+    fn default() -> Self {
+        SessionStatus::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChildProcess {
     pub pid: u32,
     pub command: String,
@@ -134,7 +144,7 @@ pub const MAX_CHAT_MESSAGES: usize = 12;
 /// executable path in its command line. Always `Cli` for Codex and OpenCode
 /// sessions — no desktop-app or editor-extension equivalent is known for
 /// those tools yet.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LaunchSurface {
     /// Plain CLI invocation: a terminal shell running an npm/homebrew/native
     /// install (or the auto-updater's `versions/<ver>` layout).
@@ -143,6 +153,16 @@ pub enum LaunchSurface {
     App,
     /// An editor extension (VS Code, Cursor, Windsurf, ...).
     Ide,
+}
+
+impl Default for LaunchSurface {
+    /// Used when a `RemoteCollector` deserializes a session missing (or
+    /// failing to parse) its `launch_surface` field — same fallback
+    /// `ClaudeCollector::detect_launch_surface` uses when detection itself
+    /// is inconclusive.
+    fn default() -> Self {
+        LaunchSurface::Cli
+    }
 }
 
 impl LaunchSurface {
@@ -223,9 +243,22 @@ pub struct AgentSession {
     /// For Claude Code: the active .claude* profile folder. For Codex: "~/.codex".
     /// For OpenCode: the data directory containing opencode.db.
     pub config_root: String,
+    /// Host this session was collected from, per `remote_hosts` config
+    /// (`[[remote_hosts]].name`). `None` for sessions collected locally.
+    /// PIDs are only unique per host — anything that acts on `pid` alone
+    /// (kill, tmux/terminal jump) must first check this is `None`.
+    pub host: Option<String>,
 }
 
 impl AgentSession {
+    /// True when this session was collected on the local machine. Kill and
+    /// terminal-jump actions must only ever act on local sessions: PIDs are
+    /// only unique per host, so a remote session's PID may collide with an
+    /// unrelated local process.
+    pub fn is_local(&self) -> bool {
+        self.host.is_none()
+    }
+
     pub fn total_tokens(&self) -> u64 {
         self.total_input_tokens
             + self.total_output_tokens
@@ -333,6 +366,7 @@ mod tests {
             thinking_since_ms: 0,
             file_accesses: Vec::new(),
             config_root: String::new(),
+            host: None,
         }
     }
 
@@ -346,5 +380,15 @@ mod tests {
     fn test_active_tokens() {
         let session = make_session(100, 50, 200, 30);
         assert_eq!(session.active_tokens(), 180); // 100 + 50 + 30, excludes cache_read
+    }
+
+    #[test]
+    fn is_local_reflects_host_field() {
+        // Guards the invariant kill/jump code relies on: only a session with
+        // `host: None` is safe to act on by local PID.
+        let mut session = make_session(0, 0, 0, 0);
+        assert!(session.is_local());
+        session.host = Some("devbox".to_string());
+        assert!(!session.is_local());
     }
 }
